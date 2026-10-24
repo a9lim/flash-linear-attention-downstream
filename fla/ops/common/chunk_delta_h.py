@@ -16,6 +16,7 @@ from fla.ops.utils.graph import get_static_buffer
 from fla.ops.utils.op import exp2
 from fla.utils import (
     IS_INTEL,
+    IS_NVIDIA,
     IS_NVIDIA_BLACKWELL,
     IS_NVIDIA_HOPPER,
     autotune_cache_kwargs,
@@ -36,6 +37,13 @@ elif IS_INTEL:
 else:
     GATED_DELTA_RULE_FWD_H_NUM_WARPS = [2, 4]
 
+# With less shared memory than A100, sm_86 and sm_89 still fit the state scans'
+# 8-16 KB tiles several stages deep. Blackwell parts of that size stay unpipelined
+# until the race above is re-validated.
+PIPELINE_STATE_SCANS = (
+    IS_NVIDIA and not IS_NVIDIA_BLACKWELL and check_shared_mem('ada') and not check_shared_mem('ampere')
+)
+
 
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
@@ -49,7 +57,7 @@ else:
     configs=[
         triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in GATED_DELTA_RULE_FWD_H_NUM_WARPS
-        for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [2, 1])
+        for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [1, 2, 3] if PIPELINE_STATE_SCANS else [2, 1])
         for BV in ([32, 64] if check_shared_mem('ada') else [32])
     ],
     key=['H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
@@ -360,8 +368,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     configs=[
         triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]
-        for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [1])
-        for BV in ([32, 64] if check_shared_mem('ada') else [32])
+        for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [1, 2, 3] if PIPELINE_STATE_SCANS else [1])
+        # 16-wide value tiles add programs where few sequences and heads leave SMs idle
+        for BV in ([16, 32, 64] if PIPELINE_STATE_SCANS else [32, 64] if check_shared_mem('ada') else [32])
     ],
     key=['H', 'HV', 'K', 'V', 'BT', 'BV', 'USE_G', 'STATE_V_FIRST'],
     **autotune_cache_kwargs,
