@@ -65,6 +65,8 @@ def fused_recurrent_precond_kda_fwd_kernel(
     BV: tl.constexpr,
     stride_init_state_token: tl.constexpr,
     stride_final_state_token: tl.constexpr,
+    stride_init_atk_token: tl.constexpr,
+    stride_final_atk_token: tl.constexpr,
     stride_indices_seq: tl.constexpr,
     stride_indices_tok: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
@@ -143,7 +145,7 @@ def fused_recurrent_precond_kda_fwd_kernel(
                 i_t = 0
             p_h0 = (
                 h0
-                + tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
+                + tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t * stride_indices_tok).to(
                     tl.int64
                 )
                 * stride_init_state_token
@@ -168,10 +170,10 @@ def fused_recurrent_precond_kda_fwd_kernel(
                 i_t = 0
             p_a0 = (
                 a0
-                + tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
+                + tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t * stride_indices_tok).to(
                     tl.int64
                 )
-                * stride_init_state_token
+                * stride_init_atk_token
             )
             p_a0 = p_a0 + i_hv * K + o_k
         else:
@@ -237,11 +239,11 @@ def fused_recurrent_precond_kda_fwd_kernel(
             b_o = tl.sum(b_h * b_q[:, None], 0)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v, eviction_policy='evict_first')
 
-        if IS_CONTINUOUS_BATCHING:
+        if IS_CONTINUOUS_BATCHING and STORE_FINAL_STATE:
             if INPLACE_FINAL_STATE:
                 p_ht = (
                     ht
-                    + tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
+                    + tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t * stride_indices_tok).to(
                         tl.int64
                     )
                     * stride_final_state_token
@@ -254,18 +256,19 @@ def fused_recurrent_precond_kda_fwd_kernel(
                 p_ht = p_ht + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
             tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
-            # Store ATK state per timestep during continuous batching (only from first v-block and k-block)
+        # Store ATK state per timestep during continuous batching (only from first v-block and k-block)
+        if IS_CONTINUOUS_BATCHING and STORE_FINAL_ATK:
             if i_v == 0 and i_k == 0:
                 if INPLACE_FINAL_STATE:
                     p_at_cb = (
                         at
-                        + tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
+                        + tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t * stride_indices_tok).to(
                             tl.int64
                         )
-                        * stride_final_state_token
+                        * stride_final_atk_token
                     )
                 else:
-                    p_at_cb = at + (bos + i_t) * stride_final_state_token
+                    p_at_cb = at + (bos + i_t) * stride_final_atk_token
                 p_at_cb = p_at_cb + i_hv * K + o_k
                 tl.store(p_at_cb, b_a.to(p_at_cb.dtype.element_ty), mask=mask_k)
 
@@ -345,17 +348,24 @@ def fused_recurrent_precond_kda_fwd(
         final_state = initial_state
         final_A_state = initial_A_state
     elif output_final_state:
+        num_states = B * T if ssm_state_indices is not None else N
         if transpose_state_layout:
-            final_state = q.new_empty(N, HV, V, K, dtype=torch.float32)
+            final_state = q.new_empty(num_states, HV, V, K, dtype=torch.float32)
         else:
-            final_state = q.new_empty(N, HV, K, V, dtype=torch.float32)
-        final_A_state = q.new_empty(N, HV, K, dtype=torch.float32)
+            final_state = q.new_empty(num_states, HV, K, V, dtype=torch.float32)
+        final_A_state = q.new_empty(num_states, HV, K, dtype=torch.float32)
     else:
         final_state = None
         final_A_state = None
 
+    # Every value tile reads the A state but only the first writes it, so an in-place write could
+    # land before a sibling tile reads the slot. The kernel writes a copy that replaces the pool after.
+    at = final_A_state.clone() if inplace_final_state and final_A_state is not None else final_A_state
+
     stride_init_state_token = initial_state.stride(0) if initial_state is not None else 1
     stride_final_state_token = final_state.stride(0) if final_state is not None else 1
+    stride_init_atk_token = initial_A_state.stride(0) if initial_A_state is not None else 1
+    stride_final_atk_token = at.stride(0) if at is not None else 1
 
     if ssm_state_indices is None:
         stride_indices_seq, stride_indices_tok = 1, 1
@@ -380,7 +390,7 @@ def fused_recurrent_precond_kda_fwd(
         h0=initial_state,
         ht=final_state,
         a0=initial_A_state,
-        at=final_A_state,
+        at=at,
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
@@ -399,6 +409,8 @@ def fused_recurrent_precond_kda_fwd(
         BV=BV,
         stride_init_state_token=stride_init_state_token,
         stride_final_state_token=stride_final_state_token,
+        stride_init_atk_token=stride_init_atk_token,
+        stride_final_atk_token=stride_final_atk_token,
         stride_indices_seq=stride_indices_seq,
         stride_indices_tok=stride_indices_tok,
         IS_BETA_HEADWISE=beta.ndim == v.ndim,
@@ -409,6 +421,8 @@ def fused_recurrent_precond_kda_fwd(
         num_warps=4,
         num_stages=2,
     )
+    if at is not final_A_state:
+        final_A_state.copy_(at)
 
     return out, final_state, final_A_state
 

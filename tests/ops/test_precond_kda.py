@@ -262,6 +262,132 @@ def test_fused_recurrent_empty_spec_decoding():
 
 
 @pytest.mark.parametrize(
+    ('transpose_state_layout', 'packed', 'index_stride', 'accepted_tokens', 'state_output'),
+    [
+        pytest.param(False, False, 2, 2, 'inplace', id='dense-strided-accepted-inplace'),
+        pytest.param(True, True, 2, 2, 'inplace', id='packed-vk-strided-accepted-inplace'),
+        pytest.param(False, True, 1, 1, 'separate', id='packed-token-states'),
+        pytest.param(True, False, 1, 1, 'separate', id='dense-vk-token-states'),
+        pytest.param(False, False, 2, 2, 'none', id='dense-strided-no-state'),
+    ],
+)
+def test_fused_recurrent_indexed_state(transpose_state_layout, packed, index_stride, accepted_tokens, state_output, monkeypatch):
+    """Continuous batching reads and writes the slots `ssm_state_indices` names, the A state by its own slot stride."""
+    monkeypatch.setattr("fla.utils.testing.FLA_CI_ENV", False)
+    torch.manual_seed(42)
+    H, K, V = 2, 32, 48
+    lengths = [2, 4] if packed else [3, 3]
+    q, k = [F.normalize(torch.randn(1, 6, H, K, device=device), dim=-1) for _ in range(2)]
+    inputs = dict(
+        q=q,
+        k=k,
+        v=torch.randn(1, 6, H, V, device=device),
+        g=F.logsigmoid(torch.randn(1, 6, H, K, device=device)),
+        g_atk=F.logsigmoid(torch.randn(1, 6, H, device=device)),
+        beta_atk=torch.rand(1, 6, H, device=device),
+        beta=torch.rand(1, 6, H, device=device),
+    )
+    h_pool = torch.randn(16, H, K, V, device=device)
+    a_pool = torch.rand(16, H, K, device=device)
+    indices = torch.arange(16, dtype=torch.int32, device=device).reshape(2, 8)[:, ::2]
+    if index_stride == 1:
+        indices = indices.contiguous()
+    accepted = torch.full((2,), accepted_tokens, dtype=torch.int32, device=device)
+
+    expected_h_pool, expected_a_pool = h_pool.clone(), a_pool.clone()
+    expected_o, expected_h, expected_a = [], [], []
+    offset = 0
+    for sequence, length in enumerate(lengths):
+        slot = indices[sequence, accepted_tokens - 1].item()
+        h, a = h_pool[slot:slot + 1], a_pool[slot:slot + 1]
+        for token in range(length):
+            position = offset + token
+            o, h, a = naive_recurrent_precond_kda(
+                **{name: x[:, position:position + 1] for name, x in inputs.items()},
+                initial_state=h,
+                initial_A_state=a,
+                output_final_state=True,
+            )
+            expected_o.append(o)
+            expected_h.append(h)
+            expected_a.append(a)
+            expected_h_pool[indices[sequence, token].item()] = h[0]
+            expected_a_pool[indices[sequence, token].item()] = a[0]
+        offset += length
+    expected_o = torch.cat(expected_o, dim=1)
+
+    if packed:
+        inputs['cu_seqlens'] = torch.tensor([0, lengths[0], sum(lengths)], dtype=torch.int32, device=device)
+    else:
+        inputs = {name: x.reshape(2, 3, *x.shape[2:]) for name, x in inputs.items()}
+    h_state = h_pool.transpose(-1, -2).contiguous() if transpose_state_layout else h_pool.clone()
+    a_state = a_pool.clone()
+    o, ht, at = fused_recurrent_precond_kda_fwd(
+        **inputs,
+        initial_state=h_state,
+        initial_A_state=a_state,
+        output_final_state=state_output == 'separate',
+        inplace_final_state=state_output == 'inplace',
+        transpose_state_layout=transpose_state_layout,
+        ssm_state_indices=indices,
+        num_accepted_tokens=accepted,
+    )
+    assert_close('o', expected_o, o.reshape_as(expected_o), 0.002)
+    h_state = h_state.transpose(-1, -2) if transpose_state_layout else h_state
+    if state_output == 'inplace':
+        untouched = torch.ones(16, dtype=torch.bool, device=device)
+        for sequence, length in enumerate(lengths):
+            untouched[indices[sequence, :length].long()] = False
+        assert torch.equal(h_state[untouched], h_pool[untouched])
+        assert torch.equal(a_state[untouched], a_pool[untouched])
+        assert_close('h pool', expected_h_pool, h_state, 0.002)
+        assert_close('A pool', expected_a_pool, a_state, 0.002)
+    else:
+        assert torch.equal(h_state, h_pool)
+        assert torch.equal(a_state, a_pool)
+        if state_output == 'none':
+            assert ht is None and at is None
+        else:
+            ht = ht.transpose(-1, -2) if transpose_state_layout else ht
+            assert_close('ht', torch.cat(expected_h), ht, 0.002)
+            assert_close('at', torch.cat(expected_a), at, 0.002)
+
+
+@pytest.mark.parametrize('indexed', [False, True], ids=['dense', 'indexed'])
+def test_fused_recurrent_inplace_A_state(indexed):
+    """Every value tile reads the A state that only the first tile writes. Thousands of one-token
+    sequences make some tiles start after their first tile has finished, so an in-place write races."""
+    torch.manual_seed(42)
+    N, H, K, V = 8192, 2, 16, 128
+    q, k = [F.normalize(torch.randn(N, 1, H, K, device=device), dim=-1) for _ in range(2)]
+    inputs = dict(
+        q=q,
+        k=k,
+        v=torch.randn(N, 1, H, V, device=device),
+        g=F.logsigmoid(torch.randn(N, 1, H, K, device=device)),
+        g_atk=F.logsigmoid(torch.randn(N, 1, H, device=device)),
+        beta_atk=torch.rand(N, 1, H, device=device),
+        beta=torch.rand(N, 1, H, device=device),
+    )
+    h_pool = torch.randn(N, H, K, V, device=device) * 0.1
+    a_pool = torch.rand(N, H, K, device=device)
+    _, ref_ht, ref_at = naive_recurrent_precond_kda(
+        **inputs, initial_state=h_pool, initial_A_state=a_pool, output_final_state=True,
+    )
+    h_state, a_state = h_pool.clone(), a_pool.clone()
+    _, ht, at = fused_recurrent_precond_kda_fwd(
+        **inputs,
+        initial_state=h_state,
+        initial_A_state=a_state,
+        inplace_final_state=True,
+        ssm_state_indices=torch.arange(N, dtype=torch.int32, device=device)[:, None] if indexed else None,
+    )
+    assert ht is h_state and at is a_state
+    torch.testing.assert_close(h_state, ref_ht, rtol=0, atol=1e-4)
+    torch.testing.assert_close(a_state, ref_at, rtol=0, atol=1e-4)
+
+
+@pytest.mark.parametrize(
     ("B", "T", "H", "K", "V", "scale", "gate_logit_normalizer", "dtype"),
     [
         pytest.param(
