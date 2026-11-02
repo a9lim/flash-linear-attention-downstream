@@ -526,7 +526,8 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
                 dyg=dg,
                 lower_bound=ctx.lower_bound,
             )
-            dA_log = dA_log.to(A_log)
+            if A_log is not None:
+                dA_log = dA_log.to(A_log)
             if dt_bias is not None:
                 ddt_bias = ddt_bias.to(dt_bias)
 
@@ -628,8 +629,8 @@ def chunk_precond_kda(
             Whether to compute the log-space KDA decay internally.
             - If `True`:
               The passed `g` acts as the raw input for `-exp(A_log).view(H, -1) * softplus(g + dt_bias.view(H, K))`.
-              Note that as part of the input arguments,
-              `A_log` (shape `[H]`) and the optional `dt_bias` (shape `[H * K]`) should be provided.
+              `A_log` (shape `[H]`) and `dt_bias` (shape `[H * K]`) are optional.
+              When `A_log` is `None`, the decay scale is 1, equivalent to `A_log=0`.
             - If `False`, `g` is expected to be the pre-computed decay value.
             Default: `False`.
         safe_gate (bool):
@@ -773,8 +774,7 @@ def chunk_precond_kda(
 
     A_log, dt_bias = None, None
     if use_gate_in_kernel:
-        assert "A_log" in kwargs, "A_log must be provided when use_gate_in_kernel=True."
-        A_log, dt_bias = kwargs["A_log"], kwargs.get("dt_bias")
+        A_log, dt_bias = kwargs.get("A_log"), kwargs.get("dt_bias")
 
     results = ChunkPrecondKDAFunction.apply(
         q,
