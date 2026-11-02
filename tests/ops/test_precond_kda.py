@@ -572,6 +572,52 @@ def test_chunk_causality(T: int, P: int, H: int, D: int, use_gate_in_kernel: boo
 
 
 @pytest.mark.parametrize(
+    ("fused_recurrent", "lower_bound"),
+    [
+        pytest.param(False, None, id="chunk"),
+        pytest.param(False, -5.0, id="chunk-lower_bound"),
+        pytest.param(True, None, id="fused_recurrent"),
+        pytest.param(True, -5.0, id="fused_recurrent-lower_bound"),
+    ],
+)
+def test_gate_in_kernel_without_A_log(fused_recurrent: bool, lower_bound: float | None):
+    """With the gate in the kernel, omitting A_log is a unit decay scale, the same as A_log=0."""
+    torch.manual_seed(42)
+    B, T, H, D = 2, 100, 2, 64
+    q = F.normalize(torch.randn(B, T, H, D), dim=-1).bfloat16()
+    k = F.normalize(torch.randn(B, T, H, D), dim=-1).bfloat16()
+    v = torch.randn(B, T, H, D, dtype=torch.bfloat16)
+    g = torch.randn(B, T, H, D, dtype=torch.bfloat16)
+    g_atk = F.logsigmoid(torch.randn(B, T, H) + 3).bfloat16()
+    beta_atk = torch.randn(B, T, H).sigmoid().bfloat16()
+    beta = torch.randn(B, T, H).sigmoid().bfloat16()
+    dt_bias = 0.1 * torch.randn(H * D)
+    log_atk_scale = torch.full((H,), -0.2)
+    leaves = [
+        x.to(device).requires_grad_(not fused_recurrent)
+        for x in (q, k, v, g, g_atk, beta_atk, beta, dt_bias, log_atk_scale)
+    ]
+    q, k, v, g, g_atk, beta_atk, beta, dt_bias, log_atk_scale = leaves
+    do = torch.randn_like(v)
+    common = dict(
+        g_atk=g_atk, beta_atk=beta_atk, beta=beta, dt_bias=dt_bias, log_atk_scale=log_atk_scale,
+        output_final_state=True, use_gate_in_kernel=True, lower_bound=lower_bound,
+    )
+
+    def run(A_log):
+        if fused_recurrent:
+            return fused_recurrent_precond_kda(q=q, k=k, v=v, g=g, A_log=A_log, use_qk_l2norm_in_kernel=False, **common)
+        o, ht, at = chunk_precond_kda(q=q, k=k, v=v, g=g, A_log=A_log, safe_gate=lower_bound is not None, **common)
+        return (o, ht, at, *torch.autograd.grad((o * do).sum(), leaves))
+
+    names = ("o", "ht", "at")
+    if not fused_recurrent:
+        names += ("dq", "dk", "dv", "dg", "dg_atk", "dbeta_atk", "dbeta", "dbias", "dlog_atk_scale")
+    for name, ref, tri in zip(names, run(torch.zeros(H, device=device)), run(None), strict=True):
+        assert_close(name, ref, tri, 0.001)
+
+
+@pytest.mark.parametrize(
     ("B", "T", "H", "K", "V", "scale", "gate_logit_normalizer", "dtype"),
     [
         pytest.param(
