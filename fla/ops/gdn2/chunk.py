@@ -110,12 +110,6 @@ class ChunkGDN2Function(torch.autograd.Function):
         )
 
         if return_intermediate_states:
-            assert torch.is_inference_mode_enabled(), (
-                "return_intermediate_states is only allowed in inference mode"
-            )
-            assert disable_recompute is False, (
-                "return_intermediate_states must be used with disable_recompute=False"
-            )
             return o.type_as(q), final_state, h
 
         ctx.save_for_backward(
@@ -275,7 +269,8 @@ def chunk_gdn2(
             retain forward intermediates for a faster backward at the cost of memory. Default: `False`.
         return_intermediate_states (Optional[bool]):
             when ``True``, also returns the per-chunk pre-states ``h`` (shape ``[B, NT, H, K, V]``).
-            Must be used inside ``torch.inference_mode()``. Default: `False`.
+            Requires ``torch.no_grad()`` or ``torch.inference_mode()``, and ``disable_recompute=False``;
+            backward is unsupported. Default: `False`.
         state_v_first (Optional[bool]):
             store the recurrent state in ``[V, K]`` layout instead of the default ``[K, V]``. Default: `False`.
         cp_context (Optional[FLACPContext]):
@@ -311,6 +306,13 @@ def chunk_gdn2(
         )
         state_v_first = kwargs.pop('transpose_state_layout')
 
+    if return_intermediate_states:
+        assert not torch.is_grad_enabled(), (
+            "return_intermediate_states requires gradients to be disabled"
+        )
+        assert disable_recompute is False, (
+            "return_intermediate_states must be used with disable_recompute=False"
+        )
     if cp_context is not None:
         assert initial_state is None, "Initial state is not supported for CP"
         assert output_final_state is False, "Output final state is not supported for CP"

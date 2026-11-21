@@ -929,6 +929,79 @@ def test_chunk_varlen_prefill(
 
 
 @pytest.mark.parametrize(
+    ("cu_seqlens", "transpose_state_layout", "inference_mode"),
+    [
+        pytest.param(None, False, False, id="dense-no_grad"),
+        pytest.param(None, False, True, id="dense-inference_mode"),
+        pytest.param(None, True, False, id="dense-vk-no_grad"),
+        pytest.param([0, 100, 300], False, False, id="varlen-no_grad"),
+    ],
+)
+def test_chunk_return_intermediate_states(cu_seqlens: list[int] | None, transpose_state_layout: bool, inference_mode: bool):
+    """Each returned h entry is the KV state entering its chunk, with gradients disabled by
+    either no_grad or inference_mode; backward is unsupported, so grad mode is rejected."""
+    torch.manual_seed(42)
+    B, T, H, D, BT = 2, 200, 2, 64, 64
+    if cu_seqlens is not None:
+        B, T = 1, cu_seqlens[-1]
+        bounds = list(zip(cu_seqlens[:-1], cu_seqlens[1:]))
+    else:
+        bounds = [(0, T)] * B
+    N = len(bounds)
+    q = F.normalize(torch.randn(B, T, H, D), dim=-1).bfloat16()
+    k = F.normalize(torch.randn(B, T, H, D), dim=-1).bfloat16()
+    v = torch.randn(B, T, H, D, dtype=torch.bfloat16)
+    gk = torch.randn(B, T, H, D, dtype=torch.bfloat16)
+    A_log = torch.empty(H).uniform_(1, 16).log()
+    dt_bias = torch.randn(H * D)
+    g_atk = F.logsigmoid(torch.randn(B, T, H) + 3)
+    beta_atk = torch.randn(B, T, H).sigmoid().bfloat16()
+    beta = torch.randn(B, T, H).sigmoid().bfloat16()
+    log_atk_scale = torch.full((H,), -0.2)
+    h0 = torch.randn(N, H, D, D) * 0.1
+    q, k, v, gk, A_log, dt_bias, g_atk, beta_atk, beta, log_atk_scale, h0 = (
+        x.to(device) for x in (q, k, v, gk, A_log, dt_bias, g_atk, beta_atk, beta, log_atk_scale, h0)
+    )
+    kwargs = dict(
+        q=q, k=k, v=v, g=gk, g_atk=g_atk, beta_atk=beta_atk, beta=beta, A_log=A_log, dt_bias=dt_bias,
+        initial_state=h0.transpose(-1, -2).contiguous() if transpose_state_layout else h0,
+        output_final_state=True, use_gate_in_kernel=True,
+        cu_seqlens=None if cu_seqlens is None else torch.LongTensor(cu_seqlens).to(device),
+        transpose_state_layout=transpose_state_layout, x=1.5, log_atk_scale=log_atk_scale,
+    )
+
+    with pytest.raises(AssertionError, match="gradients to be disabled"):
+        chunk_precond_kda(**kwargs, return_intermediate_states=True)
+    with torch.inference_mode() if inference_mode else torch.no_grad():
+        o, ht, at = chunk_precond_kda(**kwargs)
+        tri_o, tri_ht, tri_at, tri_h = chunk_precond_kda(**kwargs, return_intermediate_states=True)
+
+        g = naive_kda_gate(gk, A_log, dt_bias)
+        q_ref, k_ref = (F.normalize(x.float(), p=2, dim=-1) for x in (q, k))
+        ref_h = []
+        for i_n, (bos, eos) in enumerate(bounds):
+            i_b = 0 if cu_seqlens is not None else i_n
+            for i_c in range(math.ceil((eos - bos) / BT)):
+                if i_c == 0:
+                    ref_h.append(h0[i_n])
+                    continue
+                prefix = [x[i_b:i_b + 1, bos:bos + i_c * BT] for x in (q_ref, k_ref, v, g, g_atk, beta_atk, beta)]
+                _, ref_state, _ = naive_recurrent_precond_kda(
+                    *prefix, initial_state=h0[i_n:i_n + 1], output_final_state=True, x=1.5, log_atk_scale=log_atk_scale,
+                )
+                ref_h.append(ref_state[0])
+    ref_h = torch.stack(ref_h)
+
+    assert torch.equal(o, tri_o) and torch.equal(ht, tri_ht) and torch.equal(at, tri_at)
+    assert tri_h.shape[0] == B and tri_h.shape[1] * B == len(ref_h), tri_h.shape
+    assert tri_h.dtype == k.dtype
+    tri_h = tri_h.flatten(0, 1)
+    if transpose_state_layout:
+        tri_h = tri_h.transpose(-1, -2)
+    assert_close("h", ref_h, tri_h.float(), 0.005)
+
+
+@pytest.mark.parametrize(
     ("B", "T", "H", "K", "HAS_BIAS"),
     [
         pytest.param(*test, id="B{}-T{}-H{}-K{}-bias{}".format(*test))

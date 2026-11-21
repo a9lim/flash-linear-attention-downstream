@@ -424,8 +424,6 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
         )
 
         if return_intermediate_states:
-            assert torch.is_inference_mode_enabled(), "return_intermediate_states is only allowed in inference mode"
-            assert disable_recompute is False, "return_intermediate_states must be used with disable_recompute=False"
             return o.to(q.dtype), final_state, at, h
 
         # Don't save computed g when use_gate_in_kernel (will recompute in backward)
@@ -659,9 +657,9 @@ def chunk_precond_kda(
             will save all intermediate activations for backward pass, which is beneficial
             for training small models at the cost of increased memory usage. Default: `False`.
         return_intermediate_states (bool):
-            If True, returns intermediate state `h` for inference scenarios (e.g., vLLM).
-            Must be used within `torch.inference_mode()` and will return a 4-tuple instead of 3-tuple.
-            This is not intended for training as it bypasses autograd. Default: `False`.
+            Return the recurrent state entering each chunk as a fourth output.
+            Requires `torch.no_grad()` or `torch.inference_mode()`, and `disable_recompute=False`;
+            backward is unsupported. Default: `False`.
         cp_context (Optional[FLACPContext]):
             Context parallelism is not yet supported for the preconditioned path;
             passing a context raises `NotImplementedError`. Default: `None`.
@@ -683,7 +681,7 @@ def chunk_precond_kda(
                 Final state of shape `[N, H, K, V]` if `output_final_state=True` else `None`.
             A_state (torch.Tensor):
                 Final ATK diagonal state of shape `[N, H, K]` if `output_final_state=True` else `None`.
-        - Inference mode (return_intermediate_states=True): A tuple (o, final_state, A_state, h)
+        - With return_intermediate_states=True: A tuple (o, final_state, A_state, h)
             o (torch.Tensor):
                 Outputs of shape `[B, T, H, V]`.
             final_state (torch.Tensor):
@@ -691,7 +689,11 @@ def chunk_precond_kda(
             A_state (torch.Tensor):
                 Final ATK diagonal state of shape `[N, H, K]` if `output_final_state=True` else `None`.
             h (torch.Tensor):
-                Intermediate states of shape `[B, NT, H, K, V]` and dtype `bfloat16` for caching or further processing.
+                Intermediate states of shape `[B, NT, H, K, V]`
+                (or `[B, NT, H, V, K]` if `transpose_state_layout=True`) and dtype `k.dtype`.
+                Each entry is the KV state before its chunk; sequences start from their initial state or zero.
+                `NT = ceil(T / 64)`. For variable-length inputs, `B=1` and `NT` is the sum of per-sequence
+                chunk counts, with entries ordered by sequence and then chunk. The final state is returned separately.
 
     Examples::
         >>> import torch
@@ -733,6 +735,9 @@ def chunk_precond_kda(
         )
     """
 
+    if return_intermediate_states:
+        assert not torch.is_grad_enabled(), "return_intermediate_states requires gradients to be disabled"
+        assert disable_recompute is False, "return_intermediate_states must be used with disable_recompute=False"
     if cp_context is not None:
         raise NotImplementedError(
             "Context parallelism is not yet supported for chunk_precond_kda: "

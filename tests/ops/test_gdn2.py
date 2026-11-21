@@ -879,25 +879,26 @@ def test_chunk_matches_fused_recurrent(dtype):
 
 
 @pytest.mark.skipif(not (IS_NVIDIA or IS_AMD or IS_NPU), reason="CUDA/ROCm or Ascend NPU required")
-@torch.inference_mode()
-def test_chunk_return_intermediate_states():
-    """Returning per-chunk states preserves the output and final state."""
+@pytest.mark.parametrize(
+    "inference_mode",
+    [
+        pytest.param(True, id="inference_mode"),
+        pytest.param(False, id="no_grad"),
+    ],
+)
+def test_chunk_return_intermediate_states(inference_mode: bool):
+    """Returning per-chunk states preserves the output and final state with gradients disabled
+    by either inference_mode or no_grad; backward is unsupported, so grad mode is rejected."""
     dtype = torch.float32
     B, T, H, K, V = 2, 192, 2, 64, 64
     q, k, v, g, b, w, _, _ = _rand_inputs(B, T, H, H, K, V, dtype)
+    kwargs = dict(q=q, k=k, v=v, g=g, b=b, w=w, output_final_state=True, use_qk_l2norm_in_kernel=True)
 
-    o_ref, ht_ref = chunk_gdn2(q=q, k=k, v=v, g=g, b=b, w=w, output_final_state=True, use_qk_l2norm_in_kernel=True)
-    o, ht, h = chunk_gdn2(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        b=b,
-        w=w,
-        output_final_state=True,
-        use_qk_l2norm_in_kernel=True,
-        return_intermediate_states=True,
-    )
+    with pytest.raises(AssertionError, match="gradients to be disabled"):
+        chunk_gdn2(**kwargs, return_intermediate_states=True)
+    with torch.inference_mode() if inference_mode else torch.no_grad():
+        o_ref, ht_ref = chunk_gdn2(**kwargs)
+        o, ht, h = chunk_gdn2(**kwargs, return_intermediate_states=True)
     NT = (T + 63) // 64
     assert h.shape == (B, NT, H, K, V), f"unexpected intermediate-state shape {tuple(h.shape)}"
     assert_close("o", o_ref, o, 0.005)
